@@ -1,5 +1,3 @@
-#!/usr/bin/python
-
 from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.node import RemoteController
@@ -17,12 +15,12 @@ class IntentSDNTopo(Topo):
         s4 = self.addSwitch('s4')
 
         # create hosts
-        h1 = self.addHost('h1', ip='10.0.0.1', mac='00:00:00:00:00:01')
-        h2 = self.addHost('h2', ip='10.0.0.2', mac='00:00:00:00:00:02')
-        h3 = self.addHost('h3', ip='10.0.0.3', mac='00:00:00:00:00:03')
-        h4 = self.addHost('h4', ip='10.0.0.4', mac='00:00:00:00:00:04')
-        h5 = self.addHost('h5', ip='10.0.0.5', mac='00:00:00:00:00:05')
-        h6 = self.addHost('h6', ip='10.0.0.6', mac='00:00:00:00:00:06')
+        h1 = self.addHost('h1', ip='10.0.0.1/24', mac='00:00:00:00:00:01')
+        h2 = self.addHost('h2', ip='10.0.0.2/24', mac='00:00:00:00:00:02')
+        h3 = self.addHost('h3', ip='10.0.0.3/24', mac='00:00:00:00:00:03')
+        h4 = self.addHost('h4', ip='10.0.0.4/24', mac='00:00:00:00:00:04')
+        h5 = self.addHost('h5', ip='10.0.0.5/24', mac='00:00:00:00:00:05')
+        h6 = self.addHost('h6', ip='10.0.0.6/24', mac='00:00:00:00:00:06')
 
         # link hosts to switches
         self.addLink(h1, s1)
