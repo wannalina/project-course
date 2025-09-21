@@ -95,10 +95,10 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # !! 
+        # build instruction to apply action immediately
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
 
-        # !!
+        # if buffer id, install flow and apply to buffered packet; else install flow
         if buffer_id:
             mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
                                     priority=priority, match=match,
