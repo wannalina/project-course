@@ -5,14 +5,15 @@ import requests
 from datetime import datetime
 import json
 
+from lib.system_prompts import DECISION_SYS_PROMPT, CONFIRM_SYS_PROMPT
+
 
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 CONTROLLER_URL = os.getenv("CONTROLLER_API_URL")
 
 # init openai client (LLM)
-client = OpenAI()
-
+client = OpenAI(api_key=API_KEY)
 
 # get network topology for LLM context
 def get_network_topology():
@@ -48,18 +49,33 @@ def get_network_state():
         return None
 
 
+# parse JSON object 
+def parse_json_object(query_output):
+    try:
+        # extract JSON object from response
+        if "```json" in query_output:
+            action = query_output.split("```json")[1].split("```")[0]
+            return json.loads(action), True
+
+        return None, False
+    except Exception as e:
+        print(f"Error parsing JSON object: {e}")
+        return None, False
+
+
 # perform LLM query based on given prompt
-def perform_query(prompt):
+def perform_query(system_prompt, prompt):
     try: 
         # send query to claude
         response = client.responses.create(
-            model="gpt-5-mini",
-            input=prompt,
+            model="gpt-4o-mini",
+            input=[{"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}],
             text={"format": {"type": "text"}},
         )
 
         # parse response
-        full_reply = response.output.content[0]
+        full_reply = response.output[0].content[0].text
         print(full_reply)
         return full_reply
     except Exception as e: 
@@ -70,42 +86,31 @@ def perform_query(prompt):
 # build the query to get LLM response
 def build_query(user_intent, network_topology, network_state):
     prompt = f"""
-        
+        f"# USER INTENT\n{user_intent}\n\n"
+        f"# TOPOLOGY (may be null)\n{network_topology}\n\n"
+        f"# CONTROLLER STATE (may be null)\n{network_state}\n\n"
+        "Return ONLY JSON (no backstory)."
     """
 
     print("Processing decision query...")
-    query_res = perform_query(prompt)
+    query_res = perform_query(DECISION_SYS_PROMPT, prompt)
 
-    try:
-        # extract JSON object from response
-        if "```json" in query_res:
-            action = query_res.split("```json")[1].split("```")[0]
-            return json.loads(action), True
-
-        return query_res, False
-    except Exception as e: 
-        print(f'Failed to parse JSON object from query response.')
-        return None
+    res, is_json = parse_json_object(query_res)
+    return res, is_json
 
 
 def build_confirmation_query(intent, json_object):
     prompt = f"""
-        
+        f"# USER INTENT\n{intent}\n\n"
+        f"# CANDIDATE ACTIONS JSON\n{json.dumps(json_object, indent=2)}\n\n"
+        "Return ONLY the corrected JSON (no commentary)."
     """
 
     print("Processing confirmation query...")
-    query_res = perform_query(prompt)
+    query_res = perform_query(CONFIRM_SYS_PROMPT, prompt)
 
-    try:
-        # extract JSON object from response
-        if "```json" in query_res:
-            action = query_res.split("```json")[1].split("```")[0]
-            return json.loads(action)
-
-        return None
-    except Exception as e: 
-        print(f'Error with the confirmation query: {e}')
-        return None
+    res, _ = parse_json_object(query_res)
+    return res
 
 
 # POST action to controller and implement
