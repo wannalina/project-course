@@ -1,0 +1,5 @@
+openai==1.97.1
+python-dotenv==1.0.1
+requests==2.32.4
+ryu==4.34
+mininet==2.3.0.dev6
