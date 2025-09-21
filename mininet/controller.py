@@ -11,8 +11,11 @@ from ryu.lib.packet import ethernet
 from ryu.app import simple_switch_13
 from ryu.app.wsgi import ControllerBase, route
 from ryu.app.wsgi import WSGIApplication
+
 from webob import Response
 import json
+
+from lib.helper_funcs import cidr_to_network_mask, get_ip_proto_num
 
 # SDN controller; extends RYU SimpleSwitch13 with added stp
 class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
@@ -31,6 +34,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         self.port_desc_stats = {} # operational states / features of ports
         self.flow_stats = {}    # flow entries
         self.stp_port_state = {}  # stp port states
+        self.security_rules = {}  # ingress/egress policies per switch
 
         # inject stp and wsgi contexts
         self.stp = kwargs['stplib']
@@ -61,7 +65,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
                 port_desc_req = parser.OFPPortDescStatsRequest(dp)
                 dp.send_msg(port_desc_req)
 
-            # define state object
+            # define state object for snapshot
             state = {
                 "switches": list(self.datapaths.keys()),
                 'host_table': self.host_table,
@@ -69,7 +73,8 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
                 'port_stats': self.port_stats,
                 'stp_port_states': self.stp_port_state,
                 'port_description_stats': self.port_desc_stats,
-                'flow_tables': self.flow_stats            
+                'flow_tables': self.flow_stats,
+                'securtiy_rules': self.security_rules  
             }
 
             for dpid, dp in self.datapaths.items():
@@ -83,6 +88,25 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         except Exception as e: 
             print(f"Error getting network state: {e}")
             return None
+
+
+    # modified add_flow to support table_id
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None, table_id=0):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        # !! 
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+
+        # !!
+        if buffer_id:
+            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
+                                    priority=priority, match=match,
+                                    instructions=inst, table_id=table_id)
+        else:
+            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                    match=match, instructions=inst, table_id=table_id)
+        datapath.send_msg(mod)
 
 
     # function to delete flow entries
@@ -100,63 +124,198 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
             datapath.send_msg(mod)
 
 
-    # function to change port state
-    def set_port_state(self, dpid, port, disable=True):
+    # function to install security flow rule
+    def install_security_flow(self, datapath, match_dict, decision, priority=100):
+        match_params = {}   # OpenFlow match fields
+
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        # ensure ip traffic matching (IPv4)
+        match_params['eth_type'] = 0x0800 
+
+        # match source subnet
+        if 'src_subnet' in match_dict:
+            src_ip, src_mask = cidr_to_network_mask(match_dict['src_subnet'])
+            if src_ip and src_mask:
+                match_params['ipv4_src'] = (src_ip, src_mask)
+
+        # match dst subnet
+        if 'dst_subnet' in match_dict:
+            dst_ip, dst_mask = cidr_to_network_mask(match_dict['dst_subnet'])
+            if dst_ip and dst_mask:
+                match_params['ipv4_dst'] = (dst_ip, dst_mask)
+
+        # match ip protocol
+        if 'ip_proto' in match_dict:
+            proto_num = get_ip_proto_num(match_dict['ip_proto'])
+            if proto_num:
+                match_params['ip_proto'] = proto_num
+
+        # match transport layer dst port
+        if 'tp_dst' in match_dict and 'ip_proto' in match_dict:
+            proto = match_dict['ip_proto'].lower()
+            if proto == 'tcp':
+                match_params['tcp_dst'] = match_dict['tp_dst']
+            elif proto == 'udp':
+                match_params['udp_dst'] = match_dict['tp_dst']
+
+        match = parser.OFPMatch(**match_params)
+
+        # if allow, normal forwarding; else drop packet
+        if decision == 'allow':
+            actions = []
+            inst = [parser.OFPInstructionGotoTable(table_id=1)]
+        else:
+            actions = []
+            inst = []
+
+        #!! install flow
+        mod = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=priority,
+            match=match,
+            instructions=inst,
+            command=ofproto.OFPFC_ADD,
+            idle_timeout=0,
+            hard_timeout=0
+        )
+        datapath.send_msg(mod)
+        return f"Security rule installed: {decision} for {match_dict}"
+
+
+    #TODO: function to handle anti-spoofing (needs improvement)
+    def handle_anti_spoofing(self, action):
+        results = []
         try:
-            datapath = self.datapaths.get(dpid)
-            if not datapath:
-                return f"Datapath {dpid} not found"
+            # iterate over switches and evaluate anti-spoofing rules
+            for dpid, datapath in self.datapaths.items():
+                # get hosts for switch
+                switch_hosts = {mac: info for mac, info in self.host_table.items() if info['dpid'] == dpid}
 
-            ofproto = datapath.ofproto
-            parser = datapath.ofproto_parser
-
-            # if disable, set OFPPC_PORT_DOWN to; else clear
-            if disable:
-                config = ofproto.OFPPC_PORT_DOWN
-                state = "disabled"
-            else: 
-                config = 0
-                state = "enabled"
-            mask = ofproto.OFPPC_PORT_DOWN
-
-            # send request
-            req = parser.OFPPortMod(
-                datapath=datapath,
-                port_no=port,
-                hw_addr=datapath.ports[port].hw_addr,
-                config=config,
-                mask=mask,
-                advertise=0
-            )
-            datapath.send_msg(req)
-
-            return f"Port {port} on switch {dpid} has been {state}"
+                for mac, host_info in switch_hosts.items():
+                    #TODO: install per-port validation rules
+                    pass
+                
+                results.append(f"Switch {dpid}: Anti-spoofing rules evaluated")
+            return results
 
         except Exception as e:
-            return f"Error setting port state: {e}"
+            self.logger.error(f"Error implementing anti-spoofing: {e}")
+            return [f'[Anti-spoofing] Failed to apply anti-spoofing rules: {e}']
 
 
-    # function to check port status
-    def check_port_status(self, switch_id, port_no):
+    #?? function to block denied services
+    def block_services(self, action):
+        results = []
         try:
-            # get port stats
-            ports = self.port_desc_stats.get(switch_id, [])
+            match_dict = action.get('match', {})
 
-            found = False
-            for p in ports:
-                # if port found in stats, get port state
-                if p["port_no"] == port_no:
-                    found = True
-                    print(f"[Port Status] {switch_id}-eth{port_no} — state: {p['state']}, config: {p['config']}.")
-                    return f'[Port Status] successful: Port {switch_id}-eth{port_no} -- state: {p["state"]}, config: {p["config"]}.'
-
-            if not found:
-                print(f"[Port Status] {switch_id}-eth{port_no} not found.")
-                return f'[Port Status] failed: Port {switch_id}-eth{port_no} not found.'
+            # iterate over switches to install security rules
+            for dpid, datapath in self.datapaths.items():
+                result = self.install_security_flow(datapath, match_dict, 'deny', priority=180)
+                results.append(f"Switch {dpid}: {result}")
+            return results
 
         except Exception as e:
-            self.logger.info(f"Error checking port status: {e}")
-            return f'[Port Status] failed: Port {switch_id}-eth{port_no} not found.'
+            self.logger.error(f"Error blocking inbound services: {e}")
+            return [f'[Block Inbound] Failed to block inbound services: {e}']
+
+
+    #?? function to handle blocking outbound services
+    def block_outbound_services(self, action):
+        results = []
+        try:
+            match_dict = action.get('match', {})
+
+
+            for dpid, datapath in self.datapaths.items():
+                result = self.install_security_flow(datapath, match_dict, 'deny', priority=170)
+                results.append(f"Switch {dpid}: {result}")
+
+            return results
+        except Exception as e:
+            self.logger.error(f"Error blocking outbound services: {e}")
+            return [f'[Block Outbound] Failed to block outbound services: {e}']
+
+
+    #?? handle whitelisting HTTPS to specified destinations
+    def whitelist_https(self, action):
+        try:
+            # allow HTTPS to specific destinations
+            match_dict = action.get('match', {})
+            match_dict['ip_proto'] = 'tcp'
+            match_dict['tp_dst'] = 443
+            
+            results = []
+            for dpid, datapath in self.datapaths.items():
+                result = self.install_security_flow(datapath, match_dict, 'allow', priority=250)
+                results.append(f"Switch {dpid}: {result}")
+            
+            return results
+        except Exception as e:
+            self.logger.error(f"Error whitelisting HTTPS: {e}")
+            return [f'[HTTPS Whitelist] Failed to whitelist HTTPS: {e}']
+
+
+    # function to handle ingress filtering logic
+    def ingress_filter(self, action, priority):
+        results = []
+        try:
+            match_dict = action.get('match', {})    # match fields
+            decision = action.get('decision', 'deny')   # allow/deny
+
+            # loop through switches to install rule
+            for dpid, datapath in self.datapaths.items():
+                # check is switch in list
+                if dpid not in self.security_rules:
+                    self.security_rules[dpid] = {'ingress': [], 'egress': []}
+                
+                rule_entry = {
+                    'match': match_dict,
+                    'decision': decision,
+                    'reason': action.get('reason', '')
+                }
+                self.security_rules[dpid]['ingress'].append(rule_entry)
+
+                # install flow rule
+                result = self.install_security_flow(datapath, match_dict, decision, priority=200)
+                results.append(f"Switch {dpid}: {result}")
+            return results
+
+        except Exception as e: 
+            self.logger.error(f"Error implementing ingress action: {e}")
+            return [f'[Ingress filtering] Failed to apply ingress action: {e}']
+
+
+    # function to handle egress filtering logic
+    def egress_filter(self, action):
+        results = []
+        try:
+            match_dict = action.get('match', {})
+            decision = action.get('decision', 'deny')
+
+            # apply rule to all switches for egress
+            for dpid, datapath in self.datapaths.items():
+                # check switch exists in list
+                if dpid not in self.security_rules:
+                    self.security_rules[dpid] = {'ingress': [], 'egress': []}
+                
+                rule_entry = {
+                    'match': match_dict,
+                    'decision': decision,
+                    'reason': action.get('reason', '')
+                }
+                self.security_rules[dpid]['egress'].append(rule_entry)
+
+                # install rule
+                result = self.install_security_flow(datapath, match_dict, decision, priority=150)
+                results.append(f"Switch {dpid}: {result}")
+            return results
+
+        except Exception as e: 
+            self.logger.error(f"Error implementing egress action: {e}")
+            return [f'[Egress filtering] Failed to apply egress action: {e}']
 
 
     # event handler to set up stp config dynamically (called upon switch connection event)
@@ -178,19 +337,49 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         self.logger.info("STP config applied to DPID %s: %s", dpid, config)
 
 
+    # install table-miss flow entry
+    def _install_table_miss_flow(self, datapath):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        # table-miss (send unmatched packets to controller)
+        match = parser.OFPMatch()
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                        ofproto.OFPCML_NO_BUFFER)]
+        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+
+        # table 0 miss (security stage)
+        mod = parser.OFPFlowMod(
+            datapath=datapath, priority=0, match=match, instructions=inst,
+            table_id=0, command=ofproto.OFPFC_ADD
+        )
+        datapath.send_msg(mod)
+
+        # table 1 miss (forwarding stage)
+        mod = parser.OFPFlowMod(
+            datapath=datapath, priority=0, match=match, instructions=inst,
+            table_id=1, command=ofproto.OFPFC_ADD
+        )
+        datapath.send_msg(mod)
+
+
     # event handler to parse each flow entry to a dict
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev):
         dpid = ev.msg.datapath.id
         flows = []
+
         for stat in ev.msg.body:
             actions = []
-            # get output ports
+
+            # get output actions
             for inst in stat.instructions:
                 if hasattr(inst, "actions"):
                     for a in inst.actions:
                         if a.__class__.__name__ == "OFPActionOutput":
                             actions.append({"type": "output", "port": a.port})
+
+            # apply simplified flow view
             flows.append({
                 "priority": stat.priority,
                 "match": str(stat.match),
@@ -228,6 +417,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
 
+        # src/dst MAC addresses
         dst = eth.dst
         src = eth.src
 
@@ -236,11 +426,11 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
 
         self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
 
-        # learn a mac address to avoid FLOOD next time.
+        # learn mac address to avoid FLOOD next time (switch ingress port mapping)
         self.mac_to_port[dpid][src] = in_port
         self.host_table[src] = {"dpid": dpid, "port": in_port}
 
-        # decide egress port
+        # decide egress port (learned port; else FLOOD)
         if dst in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst]
         else:
@@ -248,10 +438,10 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
 
         actions = [parser.OFPActionOutput(out_port)]
 
-        # install a flow to avoid packet_in next time
+        # install a flow to avoid packet_in next time (flow in unicast table 1)
         if out_port != ofproto.OFPP_FLOOD:
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
-            self.add_flow(datapath, 1, match, actions)
+            self.add_flow(datapath, 1, match, actions, table_id=1)
 
         # send packet out
         data = None
@@ -262,6 +452,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
                                 in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
 
+
     # event handler to handle topology change
     @set_ev_cls(stplib.EventTopologyChange, MAIN_DISPATCHER)
     def _topology_change_handler(self, ev):
@@ -270,6 +461,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         msg = 'Receive topology change event. Flush MAC table.'
         self.logger.debug("[dpid=%s] %s", dpid_str, msg)
 
+        # remove learned unicast flows, clear L2 learning table
         if dp.id in self.mac_to_port:
             self.delete_flow(dp)
             del self.mac_to_port[dp.id]
@@ -323,12 +515,41 @@ class IntentAPI(ControllerBase):
     # route to implement new actions in controller
     @route('intent', '/intent/implement', methods=['POST'])
     def post_action(self, req, **kwargs):
-        actions = req.json or []
-        of_actions = []
-        results = []
+        try:
+            request_data = req.json or {}
+            actions = request_data.get('actions', [])
+            results = []
 
-        # loop through all proposed actions
-        for action in actions: 
-            action_type = action.get("action")  # get action type
-            return
-        return Response(content_type='application/json', body=json.dumps({"results": results}).encode('utf-8'))  
+            # loop through all actions
+            for action in actions:
+                action_direction = action.get("direction")
+                
+                if action_direction == 'ingress':
+                    result = self.controller.ingress_filter(action)
+                    results.extend(result)
+                elif action_direction == 'egress':
+                    result = self.controller.egress_filter(action)
+                    results.extend(result)
+                '''else:
+                    # handle actions without explicit direction
+                    if 'src_subnet' in action.get('match', {}):
+                        # source-based rules typically ingress
+                        result = self.controller.ingress_filter(action)
+                        results.extend(result)
+                    elif 'dst_subnet' in action.get('match', {}):
+                        # destination-based rules typically egress  
+                        result = self.controller.egress_filter(action)
+                        results.extend(result)
+                    else:
+                        # apply to both if unclear
+                        result_ingress = self.controller.ingress_filter(action)
+                        result_egress = self.controller.egress_filter(action)
+                        results.extend(result_ingress)
+                        results.extend(result_egress)
+                    '''
+
+            return Response(content_type='application/json', body=json.dumps({"results": results}, indent=2).encode('utf-8'))
+
+        except Exception as e:
+            error_response = {"error": f"Failed to process actions: {str(e)}"}
+            return Response(content_type='application/json', body=json.dumps(error_response).encode('utf-8'), status=500)
