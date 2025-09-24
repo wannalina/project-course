@@ -44,7 +44,7 @@ class IntentSDNTopo(Topo):
             "-hold",
             "-e",
             "ryu-manager",
-            "mininet/controller.py"
+            "controller/controller.py"
         ]
         self.controller_process = subprocess.Popen(cmd)
         print("Ryu controller started in xterm successfully")

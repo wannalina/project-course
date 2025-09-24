@@ -15,7 +15,7 @@ from ryu.app.wsgi import WSGIApplication
 from webob import Response
 import json
 
-from lib.helper_funcs import cidr_to_network_mask, get_ip_proto_num
+from helper_funcs import cidr_to_network_mask, get_ip_proto_num
 
 # SDN controller; extends RYU SimpleSwitch13 with added stp
 class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
@@ -35,6 +35,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         self.flow_stats = {}    # flow entries
         self.stp_port_state = {}  # stp port states
         self.security_rules = {}  # ingress/egress policies per switch
+        self.legitimate_mappings = {}   # mappings for anti-spoofing
 
         # inject stp and wsgi contexts
         self.stp = kwargs['stplib']
@@ -74,7 +75,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
                 'stp_port_states': self.stp_port_state,
                 'port_description_stats': self.port_desc_stats,
                 'flow_tables': self.flow_stats,
-                'securtiy_rules': self.security_rules  
+                'security_rules': self.security_rules  
             }
 
             for dpid, dp in self.datapaths.items():
@@ -125,149 +126,204 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
 
 
     # function to install security flow rule
-    def install_security_flow(self, datapath, match_dict, decision, priority=100):
-        match_params = {}   # OpenFlow match fields
-
+    def install_security_flow(self, datapath, match_dict, decision, priority=20000, table_id=0):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # ensure ip traffic matching (IPv4)
-        match_params['eth_type'] = 0x0800 
+        # match ipv4
+        match_params = {'eth_type': 0x0800}
 
-        # match source subnet
-        if 'src_subnet' in match_dict:
-            src_ip, src_mask = cidr_to_network_mask(match_dict['src_subnet'])
-            if src_ip and src_mask:
-                match_params['ipv4_src'] = (src_ip, src_mask)
+        # get src address (accept cidr or ip)
+        src = match_dict.get('src_subnet', '')
+        if src:
+            if '/' in src:
+                src_ip, src_mask = cidr_to_network_mask(src)
+                if src_ip and src_mask:
+                    match_params['ipv4_src'] = (src_ip, src_mask)
+            else:
+                match_params['ipv4_src'] = src  # exact host
 
-        # match dst subnet
-        if 'dst_subnet' in match_dict:
-            dst_ip, dst_mask = cidr_to_network_mask(match_dict['dst_subnet'])
-            if dst_ip and dst_mask:
-                match_params['ipv4_dst'] = (dst_ip, dst_mask)
+        # get dst address
+        dst = match_dict.get('dst_subnet', '')
+        if dst:
+            if '/' in dst:
+                dst_ip, dst_mask = cidr_to_network_mask(dst)
+                if dst_ip and dst_mask:
+                    match_params['ipv4_dst'] = (dst_ip, dst_mask)
+            else:
+                match_params['ipv4_dst'] = dst  # exact host
 
-        # match ip protocol
-        if 'ip_proto' in match_dict:
-            proto_num = get_ip_proto_num(match_dict['ip_proto'])
-            if proto_num:
+        # get protocol
+        ip_proto_str = (match_dict.get('ip_proto') or '').lower()
+        if decision.lower() == 'deny':
+            if ip_proto_str not in ('tcp', 'udp'):
+                return "Denied installing rule: 'ip_proto' must be 'tcp' or 'udp'"
+        if ip_proto_str in ('tcp', 'udp'):
+            proto_num = get_ip_proto_num(ip_proto_str)
+            if proto_num is not None:
                 match_params['ip_proto'] = proto_num
 
-        # match transport layer dst port
-        if 'tp_dst' in match_dict and 'ip_proto' in match_dict:
-            proto = match_dict['ip_proto'].lower()
-            if proto == 'tcp':
-                match_params['tcp_dst'] = match_dict['tp_dst']
-            elif proto == 'udp':
-                match_params['udp_dst'] = match_dict['tp_dst']
+        # transport dst port (only if proto given)
+        if 'tp_dst' in match_dict and ip_proto_str in ('tcp', 'udp'):
+            if ip_proto_str == 'tcp':
+                match_params['tcp_dst'] = int(match_dict['tp_dst'])
+            else:
+                match_params['udp_dst'] = int(match_dict['tp_dst'])
 
         match = parser.OFPMatch(**match_params)
 
-        # if allow, normal forwarding; else drop packet
-        if decision == 'allow':
-            actions = []
-            inst = [parser.OFPInstructionGotoTable(table_id=1)]
+        if decision.lower() == 'allow':
+            inst = [parser.OFPInstructionGotoTable(1)]
         else:
-            actions = []
             inst = []
+        
+        self.logger.info( match_params)
 
-        #!! install flow
         mod = parser.OFPFlowMod(
             datapath=datapath,
+            table_id=table_id,
             priority=priority,
             match=match,
             instructions=inst,
-            command=ofproto.OFPFC_ADD,
-            idle_timeout=0,
-            hard_timeout=0
+            command=ofproto.OFPFC_ADD
         )
         datapath.send_msg(mod)
         return f"Security rule installed: {decision} for {match_dict}"
 
 
-    #TODO: function to handle anti-spoofing (needs improvement)
+    #TODO: fix function to handle anti-spoofing
     def handle_anti_spoofing(self, action):
         results = []
         try:
-            # iterate over switches and evaluate anti-spoofing rules
             for dpid, datapath in self.datapaths.items():
-                # get hosts for switch
-                switch_hosts = {mac: info for mac, info in self.host_table.items() if info['dpid'] == dpid}
+                self.legitimate_mappings.setdefault(dpid, {})
 
-                for mac, host_info in switch_hosts.items():
-                    #TODO: install per-port validation rules
-                    pass
-                
-                results.append(f"Switch {dpid}: Anti-spoofing rules evaluated")
+                for mac, host_info in self.host_table.items():
+                    try:
+                        if not isinstance(host_info, dict) or 'dpid' not in host_info or 'port' not in host_info:
+                            self.logger.warning(f"Malformed host_info for {mac}: {host_info}")
+                            continue
+
+                        if host_info['dpid'] != dpid:
+                            continue
+
+                        mac_bytes = mac.split(':')
+                        if len(mac_bytes) != 6:
+                            self.logger.warning(f"Invalid MAC format: {mac}")
+                            continue
+
+                        last_octet = int(mac_bytes[-1], 16)
+                        suspected_ip = f"10.0.0.{last_octet}"
+
+                        self.legitimate_mappings[dpid][suspected_ip] = (mac, host_info['port'])
+
+                        parser = datapath.ofproto_parser
+                        ofproto = datapath.ofproto
+
+                        # Allow legitimate traffic
+                        match = parser.OFPMatch(
+                            eth_type=0x0800,
+                            ipv4_src=suspected_ip,
+                            in_port=host_info['port']
+                        )
+                        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
+                                                        ofproto.OFPCML_NO_BUFFER)]
+                        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+                        mod = parser.OFPFlowMod(
+                            datapath=datapath,
+                            priority=300,
+                            match=match,
+                            instructions=inst,
+                            command=ofproto.OFPFC_ADD,
+                            table_id=0
+                        )
+                        datapath.send_msg(mod)
+
+                        # Block spoofed traffic
+                        for port_no in range(1, 10):
+                            if port_no != host_info['port']:
+                                spoofed_match = parser.OFPMatch(
+                                    eth_type=0x0800,
+                                    ipv4_src=suspected_ip,
+                                    in_port=port_no
+                                )
+                                spoofed_mod = parser.OFPFlowMod(
+                                    datapath=datapath,
+                                    priority=350,
+                                    match=spoofed_match,
+                                    instructions=[],
+                                    command=ofproto.OFPFC_ADD,
+                                    table_id=0
+                                )
+                                datapath.send_msg(spoofed_mod)
+
+                    except Exception as inner_e:
+                        self.logger.error(f"Error processing host {mac}: {inner_e}")
+                        continue
+
+                results.append(f"Switch {dpid}: Anti-spoofing rules installed for {len(self.legitimate_mappings.get(dpid, {}))} hosts")
+
             return results
 
         except Exception as e:
             self.logger.error(f"Error implementing anti-spoofing: {e}")
-            return [f'[Anti-spoofing] Failed to apply anti-spoofing rules: {e}']
+            return [f'[Anti-spoofing] Failed to apply rules: {e}']
 
 
-    #?? function to block denied services
-    def block_services(self, action):
-        results = []
-        try:
-            match_dict = action.get('match', {})
 
-            # iterate over switches to install security rules
-            for dpid, datapath in self.datapaths.items():
-                result = self.install_security_flow(datapath, match_dict, 'deny', priority=180)
-                results.append(f"Switch {dpid}: {result}")
-            return results
-
-        except Exception as e:
-            self.logger.error(f"Error blocking inbound services: {e}")
-            return [f'[Block Inbound] Failed to block inbound services: {e}']
-
-
-    #?? function to handle blocking outbound services
+    # function to handle blocking outbound services
     def block_outbound_services(self, action):
         results = []
         try:
             match_dict = action.get('match', {})
 
-
             for dpid, datapath in self.datapaths.items():
-                result = self.install_security_flow(datapath, match_dict, 'deny', priority=170)
-                results.append(f"Switch {dpid}: {result}")
+                result = self.install_security_flow(datapath, match_dict, 'deny', priority=200)
+                results.append(f"Switch {dpid}: Outbound service blocked - {result}")
 
             return results
         except Exception as e:
             self.logger.error(f"Error blocking outbound services: {e}")
-            return [f'[Block Outbound] Failed to block outbound services: {e}']
+            return [f'[Outbound Block] Failed: {e}']
 
 
-    #?? handle whitelisting HTTPS to specified destinations
+    #TODO: fix handle whitelisting HTTPS to specified destinations
     def whitelist_https(self, action):
+        results = []
         try:
-            # allow HTTPS to specific destinations
             match_dict = action.get('match', {})
-            match_dict['ip_proto'] = 'tcp'
-            match_dict['tp_dst'] = 443
             
-            results = []
+            allow_match = match_dict.copy()
+            allow_match['ip_proto'] = 'tcp'
+            allow_match['tp_dst'] = 443
+            
             for dpid, datapath in self.datapaths.items():
-                result = self.install_security_flow(datapath, match_dict, 'allow', priority=250)
-                results.append(f"Switch {dpid}: {result}")
+                result = self.install_security_flow(datapath, allow_match, 'allow', priority=250)
+                results.append(f"Switch {dpid}: HTTPS allowed - {result}")
+                
+                if 'src_subnet' in match_dict:
+                    block_match = {
+                        'src_subnet': match_dict['src_subnet'],
+                        'ip_proto': 'tcp',
+                        'tp_dst': 443
+                    }
+                    block_result = self.install_security_flow(datapath, block_match, 'deny', priority=200)
+                    results.append(f"Switch {dpid}: HTTPS blocked to others - {block_result}")
             
             return results
         except Exception as e:
             self.logger.error(f"Error whitelisting HTTPS: {e}")
-            return [f'[HTTPS Whitelist] Failed to whitelist HTTPS: {e}']
+            return [f'[HTTPS Whitelist] Failed: {e}']
 
 
     # function to handle ingress filtering logic
-    def ingress_filter(self, action, priority):
+    def ingress_filter(self, action):
         results = []
         try:
-            match_dict = action.get('match', {})    # match fields
-            decision = action.get('decision', 'deny')   # allow/deny
+            match_dict = action.get('match', {})
+            decision = action.get('decision', 'deny')
 
-            # loop through switches to install rule
             for dpid, datapath in self.datapaths.items():
-                # check is switch in list
                 if dpid not in self.security_rules:
                     self.security_rules[dpid] = {'ingress': [], 'egress': []}
                 
@@ -278,14 +334,13 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
                 }
                 self.security_rules[dpid]['ingress'].append(rule_entry)
 
-                # install flow rule
-                result = self.install_security_flow(datapath, match_dict, decision, priority=200)
-                results.append(f"Switch {dpid}: {result}")
+                result = self.install_security_flow(datapath, match_dict, decision, priority=20000, table_id=0)
+                results.append(f"Switch {dpid}: Ingress - {result}")
             return results
 
         except Exception as e: 
             self.logger.error(f"Error implementing ingress action: {e}")
-            return [f'[Ingress filtering] Failed to apply ingress action: {e}']
+            return [f'[Ingress filtering] Failed: {e}']
 
 
     # function to handle egress filtering logic
@@ -522,33 +577,27 @@ class IntentAPI(ControllerBase):
 
             # loop through all actions
             for action in actions:
-                action_direction = action.get("direction")
-                
-                if action_direction == 'ingress':
-                    result = self.controller.ingress_filter(action)
-                    results.extend(result)
-                elif action_direction == 'egress':
-                    result = self.controller.egress_filter(action)
-                    results.extend(result)
-                '''else:
-                    # handle actions without explicit direction
-                    if 'src_subnet' in action.get('match', {}):
-                        # source-based rules typically ingress
-                        result = self.controller.ingress_filter(action)
-                        results.extend(result)
-                    elif 'dst_subnet' in action.get('match', {}):
-                        # destination-based rules typically egress  
-                        result = self.controller.egress_filter(action)
-                        results.extend(result)
-                    else:
-                        # apply to both if unclear
-                        result_ingress = self.controller.ingress_filter(action)
-                        result_egress = self.controller.egress_filter(action)
-                        results.extend(result_ingress)
-                        results.extend(result_egress)
-                    '''
+                action_direction = action.get("direction", "")
+                action_type = action.get("decision", "")
 
-            return Response(content_type='application/json', body=json.dumps({"results": results}, indent=2).encode('utf-8'))
+                # block inbound services
+                if action_direction == 'ingress' and (action_type == "deny" or action_type == "allow"):
+                    result = self.controller.ingress_filter(action)
+
+                # prevent spoofing
+                elif action_direction == 'ingress' and action_type == 'anti-spoofing':
+                    result = self.controller.handle_anti_spoofing(action)
+
+                # block outbound services
+                elif action_direction == 'egress' and (action_type == "deny" or action_type == "allow"):
+                    result = self.controller.egress_filter(action)
+
+                elif action_direction == 'egress' and action_type == "whitelist":
+                    result = self.controller.whitelist_https(action)
+
+                results.append(result)
+
+            return Response(content_type='application/json', body=json.dumps({"results": results}).encode('utf-8'))
 
         except Exception as e:
             error_response = {"error": f"Failed to process actions: {str(e)}"}

@@ -5,7 +5,7 @@ import requests
 from datetime import datetime
 import json
 
-from lib.system_prompts import DECISION_SYS_PROMPT, CONFIRM_SYS_PROMPT
+from lib.system_prompts import DECISION_SYS_PROMPT
 
 
 load_dotenv()
@@ -99,20 +99,6 @@ def build_query(user_intent, network_topology, network_state):
     return res, is_json
 
 
-def build_confirmation_query(intent, json_object):
-    prompt = f"""
-        f"# USER INTENT\n{intent}\n\n"
-        f"# CANDIDATE ACTIONS JSON\n{json.dumps(json_object, indent=2)}\n\n"
-        "Return ONLY the corrected JSON (no commentary)."
-    """
-
-    print("Processing confirmation query...")
-    query_res = perform_query(CONFIRM_SYS_PROMPT, prompt)
-
-    res, _ = parse_json_object(query_res)
-    return res
-
-
 # POST action to controller and implement
 def apply_action(action): 
     # post to controller
@@ -142,8 +128,7 @@ def main():
 
         action, is_json = build_query(user_intent, topology, network_state)
 
-        if action and is_json: 
-            action = build_confirmation_query(user_intent, action)
+        if action and is_json:
             doAction = input("\n\nEnter 'yes' to execute decision (otherwise return to start):\n")
 
             # if action allowed, save to history and execute
