@@ -1,3 +1,4 @@
+import re
 from dotenv import load_dotenv
 import os
 from openai import OpenAI
@@ -6,6 +7,7 @@ from datetime import datetime
 import json
 
 from lib.system_prompts import DECISION_SYS_PROMPT
+from pcap_capture import PCAPManager
 
 
 load_dotenv()
@@ -111,31 +113,79 @@ def apply_action(action):
         print(f"{reply}\n")
 
 
+# helper function to extract switch interface from pcap
+def extract_regex(regex_type, user_intent):
+    if regex_type == "interface":
+        match = re.search(r"\bs(\d+)-eth(\d+)\b", user_intent, flags=re.IGNORECASE)
+    else:
+        match = re.search(r"\bcapture_s\d+-eth\d+_\d{9,}\b", user_intent, flags=re.IGNORECASE)
+
+    if not match:
+        return None
+
+    return match.group(0) 
+
+
+# function to handle pcap start/stop/stop all
+def handle_pcap_intent(pcap_manager, user_intent):
+    try:
+        if "Start" in user_intent:
+            interface = extract_regex("interface", user_intent)
+            capture_id = pcap_manager.start_capture(interface)
+            print(f"Packet capture started with ID {capture_id} (Write down)\n")
+
+        elif "Stop capture with ID" in user_intent: 
+            capture_id = extract_regex(user_intent)
+            pcap_manager.stop_capture(capture_id)
+            print(f"Capture with ID {capture_id} stopped successfully.")
+
+        else: 
+            pcap_manager.stop_all_captures()
+
+    except Exception as e:
+        print(f"Capture operation failed: {e}")
+
+
 def main():
     action = None
+    pcap_manager = PCAPManager()
+
     while True:
         # get user intent
-        user_intent = input("Enter your intent (or 'exit' to quit):\n")
-        user_intent = user_intent.strip()
+        user_option = input("Options:\n1 - Start packet capture\n2 - Perform an action\n0 - Exit\n")
+        user_option = int(user_option.strip())
 
-        if user_intent.lower() == 'exit':
+        if user_option == 0:
             print("Exiting the intent agent...\n")
             break
+        elif user_option == 1:
+            user_intent = input("Type one of the following:\n'Start packet capture at s{number}-eth{number}'\n'Stop packet capture at s{number}-eth{number}'\n'Stop all packet captures'\n\n")
+            user_intent = user_intent.strip()
+            handle_pcap_intent(pcap_manager, user_intent)
 
-        # get context for LLM
-        topology = get_network_topology()
-        network_state = get_network_state()
+        else:
+            user_intent = input("Enter the action you would like to implement:\n\n")
+            user_intent = user_intent.strip()
 
-        action, is_json = build_query(user_intent, topology, network_state)
+            # get context for LLM
+            topology = get_network_topology()
+            network_state = get_network_state()
 
-        if action and is_json:
-            doAction = input("\n\nEnter 'yes' to execute decision (otherwise return to start):\n")
+            # perform decision query
+            action, is_json = build_query(user_intent, topology, network_state)
 
-            # if action allowed, save to history and execute
-            if doAction.lower() == 'yes':
-                apply_action(action)
-            else: 
-                print("No action available or action not needed.")
+            # if action in json format, ask permission to execute
+            if action and is_json:
+                doAction = input("\n\nEnter 'yes' to execute decision (otherwise return to start):\n")
+
+                # if action allowed, save to history and execute
+                if doAction.lower() == 'yes':
+                    apply_action(action)
+                else: 
+                    print("No action available or action not needed.")
+
+    # end all pcaps
+    pcap_manager.stop_all_captures()
 
 if __name__ == "__main__":
     main()
