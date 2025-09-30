@@ -170,8 +170,10 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         if decision.lower() == 'deny':
             if ip_proto_str not in ('tcp', 'udp'):
                 return "Denied installing rule: 'ip_proto' must be 'tcp' or 'udp'"
+
         if ip_proto_str in ('tcp', 'udp'):
             proto_num = get_ip_proto_num(ip_proto_str)
+
             if proto_num is not None:
                 match_params['ip_proto'] = proto_num
 
@@ -184,12 +186,15 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
 
         match = parser.OFPMatch(**match_params)
 
+        # determine instructions and cookie based on decision
         if decision.lower() == 'allow':
             inst = [parser.OFPInstructionGotoTable(1)]
+            cookie = 0x5EC00000 | 0x0001    # security cookies (allow rule)
         else:
             inst = []
-        
-        self.logger.info( match_params)
+            cookie = 0x5EC00000 | 0x0002    # security cookie (deny rule)
+
+        self.logger.info(match_params)
 
         mod = parser.OFPFlowMod(
             datapath=datapath,
@@ -197,6 +202,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
             priority=priority,
             match=match,
             instructions=inst,
+            cookie=cookie,
             command=ofproto.OFPFC_ADD
         )
         datapath.send_msg(mod)
@@ -347,7 +353,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
                         datapath=dp, table_id=1,
                         command=ofp.OFPFC_DELETE,
                         out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY,
-                        cookie=self.SAV_COOKIE, cookie_mask=self.SAV_COOKIE_MASK,
+                        cookie=0xA11E0001, cookie_mask=0xFFFFFFFF,
                         match=parser.OFPMatch()
                     )
                     dp.send_msg(mod)
@@ -379,33 +385,59 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
             return [f'[Outbound Block] Failed: {e}']
 
 
-    #TODO: fix handle whitelisting HTTPS to specified destinations
+    # function to handle whitelisting HTTPS to specified destinations
     def whitelist_https(self, action):
         results = []
         try:
             match_dict = action.get('match', {})
             
-            allow_match = match_dict.copy()
-            allow_match['ip_proto'] = 'tcp'
-            allow_match['tp_dst'] = 443
+            # Validate required fields
+            if not match_dict.get('dst_subnet'):
+                return [f'[HTTPS Whitelist] Failed: dst_subnet required for whitelisting']
+            
+            dst_subnet = match_dict['dst_subnet']
+            src_subnet = match_dict.get('src_subnet', None)
             
             for dpid, datapath in self.datapaths.items():
-                result = self.install_security_flow(datapath, allow_match, 'allow', priority=250)
-                results.append(f"Switch {dpid}: HTTPS allowed - {result}")
-                
-                if 'src_subnet' in match_dict:
-                    block_match = {
-                        'src_subnet': match_dict['src_subnet'],
+                try:
+                    # allow HTTPS to whitelisted dsts (high priority)
+                    allow_match = {
+                        'dst_subnet': dst_subnet,
                         'ip_proto': 'tcp',
                         'tp_dst': 443
                     }
-                    block_result = self.install_security_flow(datapath, block_match, 'deny', priority=200)
-                    results.append(f"Switch {dpid}: HTTPS blocked to others - {block_result}")
-            
+
+                    if src_subnet:
+                        allow_match['src_subnet'] = src_subnet
+
+                    result = self.install_security_flow(
+                        datapath, allow_match, 'allow', 
+                        priority=30000, table_id=0
+                    )
+                    results.append(f"Switch {dpid}: HTTPS allowed to {dst_subnet} - {result}")
+
+                    # if source specified, block HTTPS from that subnet to other dsts
+                    if src_subnet:
+                        block_match = {
+                            'src_subnet': src_subnet,
+                            'ip_proto': 'tcp',
+                            'tp_dst': 443
+                        }
+
+                        block_result = self.install_security_flow(
+                            datapath, block_match, 'deny', 
+                            priority=25000, table_id=0
+                        )
+                        results.append(f"Switch {dpid}: HTTPS blocked from {src_subnet} to others - {block_result}")
+
+                except Exception as e:
+                    results.append(f"Switch {dpid}: HTTPS whitelist failed - {str(e)}")
+
             return results
+
         except Exception as e:
             self.logger.error(f"Error whitelisting HTTPS: {e}")
-            return [f'[HTTPS Whitelist] Failed: {e}']
+            return [f'[HTTPS Whitelist] Failed: {str(e)}']
 
 
     # function to handle ingress filtering logic
@@ -465,6 +497,26 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
             return [f'[Egress filtering] Failed to apply egress action: {e}']
 
 
+    # function to drop https traffic by default
+    def install_default_https_drop(self, datapath):
+        ofp = datapath.ofproto
+        p = datapath.ofproto_parser
+
+        # drop TCP dst 443 (HTTPS over TCP)
+        match_tcp = p.OFPMatch(eth_type=0x0800, ip_proto=6, tcp_dst=443)
+        mod_tcp = p.OFPFlowMod(datapath=datapath, table_id=0, priority=10000,
+                            match=match_tcp, instructions=[],  # no instructions = drop
+                            cookie=0x5EC0DE43, command=ofp.OFPFC_ADD)
+        datapath.send_msg(mod_tcp)
+
+        # drop UDP dst 443 (HTTP/3 / QUIC)
+        match_udp = p.OFPMatch(eth_type=0x0800, ip_proto=17, udp_dst=443)
+        mod_udp = p.OFPFlowMod(datapath=datapath, table_id=0, priority=10000,
+                            match=match_udp, instructions=[],
+                            cookie=0x5EC0DE43, command=ofp.OFPFC_ADD)
+        datapath.send_msg(mod_udp)
+
+
     # event handler to set up stp config dynamically (called upon switch connection event)
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def _stp_switch_connected(self, ev):
@@ -487,6 +539,9 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         # register switch and install table-miss pipeline
         self.datapaths[dpid] = dp
         self.install_table_miss_flow(dp)
+
+        # drop https by default
+        self.install_default_https_drop(dp)
 
 
     # install table-miss flow entry
@@ -723,14 +778,14 @@ class IntentAPI(ControllerBase):
                     result = self.controller.handle_sav_actions(action)
 
                 # block inbound services
-                elif action_direction == 'ingress' and (action_type == "deny" or action_type == "allow"):
+                elif action_direction == 'ingress':
                     result = self.controller.ingress_filter(action)
 
                 # block outbound services
-                elif action_direction == 'egress' and (action_type == "deny" or action_type == "allow"):
+                elif action_direction == 'egress':
                     result = self.controller.egress_filter(action)
 
-                elif action_direction == 'egress' and action_type == "whitelist":
+                elif action_type == "whitelist":
                     result = self.controller.whitelist_https(action)
 
                 results.append(result)
