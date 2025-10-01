@@ -11,16 +11,15 @@ DECISION_SYS_PROMPT = (
     '      "direction"?: "ingress" | "egress",\n'
     '      "reason"?: "string"\n'
     "    },\n"
-    "    // SAV management actions (optional): include as standalone objects without 'decision'/'match'\n"
-    "    {  \"sav_subnets\": { \"1\": [\"10.0.0.1/32\", \"10.0.0.5/32\", \"10.0.0.6/32\"], \"3\": [\"10.0.0.2/32\", \"10.0.0.3/32\", \"10.0.0.4/32\"]\n"
-    "    { \"sav_enabled\": true|false },\n"
+    "SAV management actions: include as standalone objects without 'decision'/'match'\n"
+    "    { \"clear_blocked\": true },\n"
     "    { \"clear_bindings\": true },\n"
-    "    { \"clear_blocked\": true }\n"
-    "  ]\n"
+    "    { \"sav_enabled\": true|false },\n"
+    "    { \"sav_subnets\": { \"1\": [\"10.0.0.0/24\"], \"2\": [\"10.0.0.0/24\"], \"3\": [\"10.0.0.0/24\"], \"4\": [\"10.0.0.0/24\"] } }\n"
     "}\n"
     "Notes on SAV management:\n"
     "- DPIDs must be strings (e.g., \"1\").\n"
-    "- CIDRs must be valid IPv4 networks; multiple DPIDs and subnets are allowed.\n"
-    "- CIDRs and IP addresses must be precise, no generic addresses e.g. \"10.0.0.0/24\""
+    "- CIDRs must be valid IPv4 subnets (e.g., \"10.0.0.0/24\").\n"
+    "- Use subnet ranges when possible (do NOT force per-host /32 addresses unless the user explicitly asks).\n"
     "- Do NOT propose per-IP block actions; the controller blocks violators automatically.\n\n"
 )

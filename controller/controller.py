@@ -40,14 +40,12 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         self.flow_stats = {}    # flow entries
         self.stp_port_state = {}  # stp port states
         self.security_rules = {}  # ingress/egress policies per switch
-        self.ip_bindings = {}   # mappings for anti-spoofing
-        self.protected_ips = set()
 
         # sav components
-        self.sav_enabled = True     # sav enabled by default
-        self.allowed_subnets = {}  # allowed subnets for each switch
-        self.host_bindings = {}    # host bindings
-        self.blocked_ips = set()    # list of blocked ip addresses
+        self.sav_enabled = False     # sav disabled by default
+        self.allowed_subnets = {}  # allowed source address ranges per switch
+        self.host_bindings = {}    # host bindings per switch
+        self.blocked_ips = set()    # list of ip addresses where block rules installed
 
         # inject stp and wsgi contexts
         self.stp = kwargs['stplib']
@@ -111,7 +109,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         # build instruction to apply action immediately
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
 
-        # if buffer id, install flow and apply to buffered packet; else install flow
+        # if buffer id, install flow and apply to buffered packet; else normal install flow
         if buffer_id:
             mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
                                     priority=priority, match=match,
@@ -137,12 +135,12 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
             datapath.send_msg(mod)
 
 
-    # function to install security flow rule
+    # function to install security flow rule in table
     def install_security_flow(self, datapath, match_dict, decision, priority=20000, table_id=0):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # match ipv4
+        # match ipv4 frames
         match_params = {'eth_type': 0x0800}
 
         # get src address (accept cidr or ip)
@@ -153,7 +151,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
                 if src_ip and src_mask:
                     match_params['ipv4_src'] = (src_ip, src_mask)
             else:
-                match_params['ipv4_src'] = src  # exact host
+                match_params['ipv4_src'] = src  # exact host (/32)
 
         # get dst address
         dst = match_dict.get('dst_subnet', '')
@@ -163,9 +161,9 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
                 if dst_ip and dst_mask:
                     match_params['ipv4_dst'] = (dst_ip, dst_mask)
             else:
-                match_params['ipv4_dst'] = dst  # exact host
+                match_params['ipv4_dst'] = dst
 
-        # get protocol
+        # get L4 protocol (only allow/deny for tcp and udp)
         ip_proto_str = (match_dict.get('ip_proto') or '').lower()
         if decision.lower() == 'deny':
             if ip_proto_str not in ('tcp', 'udp'):
@@ -177,7 +175,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
             if proto_num is not None:
                 match_params['ip_proto'] = proto_num
 
-        # transport dst port (only if proto given)
+        # L4 dst port (only if proto given)
         if 'tp_dst' in match_dict and ip_proto_str in ('tcp', 'udp'):
             if ip_proto_str == 'tcp':
                 match_params['tcp_dst'] = int(match_dict['tp_dst'])
@@ -186,7 +184,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
 
         match = parser.OFPMatch(**match_params)
 
-        # determine instructions and cookie based on decision
+        # if allow, go to table 1 (continue); else deny (drop)
         if decision.lower() == 'allow':
             inst = [parser.OFPInstructionGotoTable(1)]
             cookie = 0x5EC00000 | 0x0001    # security cookies (allow rule)
@@ -196,6 +194,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
 
         self.logger.info(match_params)
 
+        # install policy rule
         mod = parser.OFPFlowMod(
             datapath=datapath,
             table_id=table_id,
@@ -214,10 +213,11 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         valid_subnets = []
         try:
             for subnet in subnets:
-                # validate cidr notation
+                # validate cidr
                 ipaddress.IPv4Network(subnet, strict=False)
                 valid_subnets.append(subnet)
 
+            # save per-switch list
             self.allowed_subnets[dpid] = valid_subnets
             self.logger.info(f"Configured {len(valid_subnets)} allowed subnets for switch {dpid}")
             return True
@@ -227,25 +227,29 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
             return False
 
 
-    # function to check if source ip allowed based on configed sbubnets
+    # function to check if source ip allowed based on configed sbubnets for switch
     def is_source_allowed(self, dpid, src_ip):
-        # if not in allowed subnets, no configuration for switch
+        # if no configuration, allow
         if dpid not in self.allowed_subnets:
             return True
 
         try:
+            # validate ipv4 address
             src_addr = ipaddress.IPv4Address(src_ip)
+
+            # check if src in allowed subnets
             for subnet in self.allowed_subnets[dpid]:
                 network = ipaddress.IPv4Network(subnet, strict=False)
                 if src_addr in network:
                     return True
+
             return False
 
         except ValueError:
             return False
 
 
-    # function to implement FCFS binding validation
+    # function to implement FCFS binding validation (ip <--> mac)
     def validate_host_binding(self, dpid, src_ip, src_mac, in_port):
         # no bindings exist
         if dpid not in self.host_bindings:
@@ -259,55 +263,148 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
 
             # check do mac address and port match
             if existing['mac'] == src_mac and existing['port'] == in_port:
+                # update last seen timestamp
+                existing['last_seen'] = current_time
                 return True, "Valid existing binding"
             else:
-                return False, f"IP {src_ip} bound to different MAC/port"
+                return False, f"IP {src_ip} bound to MAC {existing['mac']}:{existing['port']}, got {src_mac}:{in_port}"
 
-        # create new binding
+        # check if mac is already bound to different ip (flag spoofing)
+        for bound_ip, binding in self.host_bindings[dpid].items():
+            if binding['mac'] == src_mac and binding['port'] == in_port and bound_ip != src_ip:
+                return False, f"MAC {src_mac} already bound to IP {bound_ip}, attempted to use {src_ip}"
+
+        # create new binding for ip
         self.host_bindings[dpid][src_ip] = {
             'mac': src_mac,
             'port': in_port,
-            'first_seen': current_time
+            'first_seen': current_time,
+            'last_seen': current_time
         }
 
         self.logger.info(f"Created new binding: {dpid} - {src_ip} -> {src_mac}:{in_port}")
         return True, "New binding created"
 
 
-    # function to install flow rule to block traffic from source ip
-    def block_source_ip(self, dpid, src_ip):
+    # function to install proactive sav rules for allowed subnets
+    def install_proactive_sav_rules(self, dpid):
+        if dpid not in self.allowed_subnets:
+            return
+
+        dp = self.datapaths.get(dpid)
+        if not dp:
+            return
+
+        parser = dp.ofproto_parser
+        ofp = dp.ofproto
+
+        # for each allowed subnet, install low-priority allow rule
+        for subnet in self.allowed_subnets[dpid]:
+            try:
+                # convert subnet to match parameters
+                src_ip, src_mask = cidr_to_network_mask(subnet)
+                if not src_ip or not src_mask:
+                    continue
+                
+                # allow IPv4 packets from subnet in table 1 (go to table 2)
+                match = parser.OFPMatch(
+                    eth_type=0x0800,
+                    ipv4_src=(src_ip, src_mask)
+                )
+
+                inst = [parser.OFPInstructionGotoTable(2)]
+                mod = parser.OFPFlowMod(
+                    datapath=dp,
+                    table_id=1,
+                    priority=5000,
+                    match=match,
+                    instructions=inst,
+                    cookie=0xA11E0002,  # sav allow cookie
+                    command=ofp.OFPFC_ADD
+                )
+                dp.send_msg(mod)
+
+                # allow ARP from this subnet (go to table 2)
+                match_arp = parser.OFPMatch(
+                    eth_type=0x0806,
+                    arp_spa=(src_ip, src_mask)
+                )
+
+                inst_arp = [parser.OFPInstructionGotoTable(2)]
+                mod_arp = parser.OFPFlowMod(
+                    datapath=dp,
+                    table_id=1,
+                    priority=5000,
+                    match=match_arp,
+                    instructions=inst_arp,
+                    cookie=0xA11E0002,
+                    command=ofp.OFPFC_ADD
+                )
+                dp.send_msg(mod_arp)
+
+                self.logger.info(f"Installed proactive SAV rules for {subnet} on switch {dpid}")
+
+            except Exception as e:
+                self.logger.error(f"Error installing proactive SAV rule: {e}")
+
+
+    # function to install flow rule to block traffic from source ip (network-wide)
+    def block_source_ip(self, src_ip, reason="SAV violation"):
         try:
             if not src_ip:
                 self.logger.error("block_source_ip called with empty src_ip")
                 return False
 
             try:
+                # validate ip
                 ipaddress.IPv4Address(src_ip)
-
             except Exception as e:
                 self.logger.error(f"block_source_ip invalid IPv4: {src_ip}")
                 return False
 
-            dp = self.datapaths.get(dpid)
-            if not dp:
-                return False
+            blocked_count = 0
+            for dpid, dp in self.datapaths.items():
+                try:
+                    parser = dp.ofproto_parser
+                    ofp = dp.ofproto
 
-            parser = dp.ofproto_parser
-            ofp = dp.ofproto
-            match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip)
+                    # block IPv4 from this source
+                    match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip)
+                    mod = parser.OFPFlowMod(
+                        datapath=dp,
+                        table_id=1,
+                        priority=30000,
+                        match=match,
+                        instructions=[],
+                        cookie=0xA11E0001,
+                        command=ofp.OFPFC_ADD
+                    )
+                    dp.send_msg(mod)
 
-            # no instructions, tag with cookie to del later (drop); includes sav cookie
-            mod = parser.OFPFlowMod(
-                datapath=dp, table_id=1, priority=25000,
-                match=match, instructions=[],
-                cookie=0xA11E0001, command=ofp.OFPFC_ADD
-            )
-            dp.send_msg(mod)
-            self.blocked_ips.add(src_ip)
+                    # block arp from this source
+                    match_arp = parser.OFPMatch(eth_type=0x0806, arp_spa=src_ip)
+                    mod_arp = parser.OFPFlowMod(
+                        datapath=dp,
+                        table_id=1,
+                        priority=30000,
+                        match=match_arp,
+                        instructions=[],
+                        cookie=0xA11E0001,  # sav drop cookie
+                        command=ofp.OFPFC_ADD
+                    )
+                    dp.send_msg(mod_arp)
 
-            self.blocked_ips.add(src_ip)
-            self.logger.warning(f"BLOCKED source IP {src_ip} on switch {dpid}")
-            return True
+                    blocked_count += 1
+
+                except Exception as e:
+                    self.logger.error(f"Error blocking {src_ip} on switch {dpid}: {e}")
+
+            if blocked_count > 0:
+                # record offender
+                self.blocked_ips.add(src_ip)
+                self.logger.warning(f"BLOCKED source IP {src_ip} on {blocked_count} switches - {reason}")
+                return True
+            return False
 
         except Exception as e:
             self.logger.error(f"Error blocking source IP {src_ip}: {e}")
@@ -321,11 +418,15 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
             # configure allowed sav subnets
             if "sav_subnets" in action:
                 subnet_config = action["sav_subnets"]
+
                 for dpid_str, subnets in subnet_config.items():
                     try:
                         dpid = int(dpid_str)
                         if self.configure_sav_subnets(dpid, subnets):
                             results.append(f"[SAV] Configured subnets for switch {dpid}: {subnets}")
+
+                            # install proactive allows
+                            self.install_proactive_sav_rules(dpid)
                         else:
                             results.append(f"[SAV] Failed to configure subnets for switch {dpid}")
                     except ValueError:
@@ -336,27 +437,34 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
                 self.sav_enabled = bool(action["sav_enabled"])
                 results.append(f"[SAV] {'Enabled' if self.sav_enabled else 'Disabled'}")
 
-            # clear bindings
+                # if enabling, install proactive rules for all configured switches
+                if self.sav_enabled:
+                    for dpid in self.allowed_subnets.keys():
+                        self.install_proactive_sav_rules(dpid)
+
+            # clear fcfs bindings map
             if action.get("clear_bindings", False):
                 cleared_count = sum(len(bindings) for bindings in self.host_bindings.values())
                 self.host_bindings.clear()
                 results.append(f"[SAV] Cleared {cleared_count} host bindings")
 
-            # clear blocked IPs
+            # clear blocked IPs (remove sav drop rules)
             if action.get("clear_blocked", False):
                 # delete flow rules for blocked IPs
                 for dpid, dp in self.datapaths.items():
                     parser = dp.ofproto_parser
                     ofp = dp.ofproto
+
                     # delete all sav-tagged entries in table 1
                     mod = parser.OFPFlowMod(
                         datapath=dp, table_id=1,
                         command=ofp.OFPFC_DELETE,
                         out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY,
-                        cookie=0xA11E0001, cookie_mask=0xFFFFFFFF,
+                        cookie=0xA11E0001, cookie_mask=0xFFFFFFFF,  # mattch only sav drop
                         match=parser.OFPMatch()
                     )
                     dp.send_msg(mod)
+
                 blocked_count = len(self.blocked_ips)
                 self.blocked_ips.clear()
                 results.append(f"[SAV] Unblocked {blocked_count} IP addresses (cookie wipe)")
@@ -366,7 +474,6 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         except Exception as e:
             self.logger.error(f"Error handling SAV actions: {e}")
             return {"results": [f"[SAV] Error: {str(e)}"]}
-
 
 
     # function to handle blocking outbound services
@@ -390,17 +497,17 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         results = []
         try:
             match_dict = action.get('match', {})
-            
-            # Validate required fields
+
+            # if no dst subnet/host to whitelist, return
             if not match_dict.get('dst_subnet'):
                 return [f'[HTTPS Whitelist] Failed: dst_subnet required for whitelisting']
-            
+
             dst_subnet = match_dict['dst_subnet']
             src_subnet = match_dict.get('src_subnet', None)
-            
+
             for dpid, datapath in self.datapaths.items():
                 try:
-                    # allow HTTPS to whitelisted dsts (high priority)
+                    # allow https to whitelisted dsts (high priority, table 0)
                     allow_match = {
                         'dst_subnet': dst_subnet,
                         'ip_proto': 'tcp',
@@ -416,7 +523,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
                     )
                     results.append(f"Switch {dpid}: HTTPS allowed to {dst_subnet} - {result}")
 
-                    # if source specified, block HTTPS from that subnet to other dsts
+                    # if subnet given, block tcp/443 (https) from that src to all dsts
                     if src_subnet:
                         block_match = {
                             'src_subnet': src_subnet,
@@ -450,7 +557,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
             for dpid, datapath in self.datapaths.items():
                 if dpid not in self.security_rules:
                     self.security_rules[dpid] = {'ingress': [], 'egress': []}
-                
+
                 rule_entry = {
                     'match': match_dict,
                     'decision': decision,
@@ -502,14 +609,14 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         ofp = datapath.ofproto
         p = datapath.ofproto_parser
 
-        # drop TCP dst 443 (HTTPS over TCP)
+        # drop tcp dst 443 (https)
         match_tcp = p.OFPMatch(eth_type=0x0800, ip_proto=6, tcp_dst=443)
         mod_tcp = p.OFPFlowMod(datapath=datapath, table_id=0, priority=10000,
                             match=match_tcp, instructions=[],  # no instructions = drop
                             cookie=0x5EC0DE43, command=ofp.OFPFC_ADD)
         datapath.send_msg(mod_tcp)
 
-        # drop UDP dst 443 (HTTP/3 / QUIC)
+        # drop udp dst 443
         match_udp = p.OFPMatch(eth_type=0x0800, ip_proto=17, udp_dst=443)
         mod_udp = p.OFPFlowMod(datapath=datapath, table_id=0, priority=10000,
                             match=match_udp, instructions=[],
