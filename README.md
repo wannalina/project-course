@@ -69,18 +69,43 @@ This will initialize the Mininet network simulation, start the RYU controller, a
 Once the controller has finished initializing, test it using the `pingall` command to verify that all hosts can reach each other.
 
 3. **Initialize the main application**
-Use the following command to initialize PatchHunter: 
+Use the following command to initialize the program: 
 `sudo python3 northbound_agent.py`
 
 4. **Ask questions and perform actions**
-Observe that the command line interface of `northbound_agent.py`, the program asks for user input (intent). 
-On this command line, enter a question or a command, for example, "Please disable all ports on switch 1". 
-Then, review the agent's repsonse. If the proposed action corresponds to what you want to achieve, reply "yes" to the agent to confirm and execute the action.
+Observe that the command line interface of `northbound_agent.py`, the program asks for user input (intent) as follows: 
+![alt text](img/main_menu.png)
+Below is a walk-through of each option and its expected output.
 
-5. **Test the action**
-!!
+    **Option 1: Start / stop packet captures:**
+    After selecting option 1, a new menu opens up as follows: 
+    ![alt text](img/pcap_menu.png)
+    To start a packet capture at a specific interface of a switch, you must type, "Start packet capture at s1-eth1", for instance. This will begin capturing packets at interface eth1 of switch 1 until it is manually stopped by selecting option 1 again in the main menu and selecting the option "Stop packet capture at {capture ID}" or "Stop all packet captures". Keep in mind that when starting a packet capture, you will receive the capture ID on the command line after the capture starts successfully. This will be needed when stopping a single packet capture as there may be several packet captures at different switches / interfaces active at once, so it is a good idea to write it down.
 
-6. **To exit the program**, stop the PatchHunter application by typing "exit" on the `northbound_agent.py` command line interface. Then stop the Mininet instance using the following command: 
+    **Option 2: Perform an action:**
+    After selecting option 2, the program will prompt the user to enter an action to implement in the controller. As this project focuses on ingress and egress filtering, example actions to implement could include the following:
+    - **Block / unblock inbound services:** "Allow inbound ICMP for 10.0.0.5/24 and drop other inbound traffic."
+    - **Block / unblock outbound services:** Block outbound UDP from 10.0.0.4/24."
+    - **Implement Source Address Validation (SAV) as an anti-spoofing measure:** "Enable anti-spoofing so that each access port only accepts IPv4 packets whose source MAC and source IP match the learned host on that port."
+    - **Whitelist HTTPS destinations:** "Whitelist outbound HTTPS to h5."
+
+    **Option 0: Exit program**
+
+5. **To test the action**, the user may perform a series of tests in the Mininet terminal window. However, the specific tests depend on the action implemented, so here are a couple of examples: 
+
+    5.1. **To test a blocked inbound service:**
+    First, open an xterm window for h5. in the h5 xterm window, type the command `python3 -m http.server 80 &` to set up a listener on the server.
+    Then, open an xterm window for any of the other hosts, for example h2. In the xterm window of h2, execute the command `curl -m 3 -v http://10.0.0.5:80/`. The result should 
+
+
+    5.2. **To test a blocked outbound service:**
+
+    5.3 **To test spoofing attacks:** 
+
+    5.4 **To test whitelisted HTTPS destinations:**
+
+
+6. **To exit the program**, stop the application by typing "exit" on the `northbound_agent.py` command line interface. Then stop the Mininet instance using the following command: 
 `exit`
 Finally, clear and clean up any leftover Mininet network states and processes using the command: 
 `sudo mn -c`
