@@ -126,7 +126,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         parser = datapath.ofproto_parser
 
         # loop through known dsts; delete matching flows
-        for dst in self.mac_to_port[datapath.id].keys():
+        for dst in list(self.mac_to_port.get(datapath.id, {}).keys()):
             match = parser.OFPMatch(eth_dst=dst)
             mod = parser.OFPFlowMod(
                 datapath, command=ofproto.OFPFC_DELETE,
@@ -166,21 +166,23 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
         # get L4 protocol (only allow/deny for tcp and udp)
         ip_proto_str = (match_dict.get('ip_proto') or '').lower()
         if decision.lower() == 'deny':
-            if ip_proto_str not in ('tcp', 'udp'):
-                return "Denied installing rule: 'ip_proto' must be 'tcp' or 'udp'"
+            if ip_proto_str not in ('tcp', 'udp', 'icmp'):
+                return "Denied installing rule: 'ip_proto' must be 'tcp', 'udp', or 'icmp'"
 
-        if ip_proto_str in ('tcp', 'udp'):
+        if ip_proto_str in ('tcp', 'udp', 'icmp'):
             proto_num = get_ip_proto_num(ip_proto_str)
 
             if proto_num is not None:
                 match_params['ip_proto'] = proto_num
 
         # L4 dst port (only if proto given)
-        if 'tp_dst' in match_dict and ip_proto_str in ('tcp', 'udp'):
+        if 'tp_dst' in match_dict and ip_proto_str in ('tcp', 'udp', 'icmp'):
             if ip_proto_str == 'tcp':
                 match_params['tcp_dst'] = int(match_dict['tp_dst'])
-            else:
+            elif ip_proto_str == 'udp':
                 match_params['udp_dst'] = int(match_dict['tp_dst'])
+            else: 
+                match_params['icmp_dst'] = int(match_dict['tp_dst'])
 
         match = parser.OFPMatch(**match_params)
 
@@ -577,9 +579,14 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
     # function to handle egress filtering logic
     def egress_filter(self, action):
         results = []
+        priority = 0
         try:
             match_dict = action.get('match', {})
             decision = action.get('decision', 'deny')
+            if decision == "allow":
+                priority = 30000
+            else: 
+                priority = 25000
 
             # apply rule to all switches for egress
             for dpid, datapath in self.datapaths.items():
@@ -595,7 +602,7 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
                 self.security_rules[dpid]['egress'].append(rule_entry)
 
                 # install rule
-                result = self.install_security_flow(datapath, match_dict, decision, priority=150)
+                result = self.install_security_flow(datapath, match_dict, decision, priority=priority)
                 results.append(f"Switch {dpid}: {result}")
             return results
 
@@ -757,14 +764,14 @@ class SimpleSwitch13(simple_switch_13.SimpleSwitch13):
             # check allowed subnets
             if not self.is_source_allowed(dpid, src_ip):
                 self.logger.warning(f"SAV: Source {src_ip} not in allowed subnets on switch {dpid}")
-                self.block_source_ip(dpid, src_ip)   # installs drop in table 1
+                self.block_source_ip(src_ip, reason="SAV: subnet not allowed")   # installs drop in table 1
                 return
 
             # check FCFS host binding (IP <--> MAC/port)
             ok, reason = self.validate_host_binding(dpid, src_ip, src, in_port)
             if not ok:
                 self.logger.warning(f"SAV: Binding violation - {reason}")
-                self.block_source_ip(dpid, src_ip)
+                self.block_source_ip(src_ip,reason="SAV: binding violation")
                 return
 
         # arp learning path (keeps bindings fresh, also filtered)
