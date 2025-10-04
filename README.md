@@ -2,23 +2,57 @@
 
 ## Description
 
-This project is a Python application that implements intent-based networking using a large language model (LLM). It integrates the LLM into the decision-making loop of an SDN network by taking natural-language input from the operator and a snapshot of the current network state to diagnose issues and to propose and implement changes in the SDN controller (e.g., ingress/egress filtering, flow updates, and port operations). The goal is to simplify and automate network management so humans can interact with the network using plain language—enabling faster troubleshooting, safer action execution with confirmation, smarter decisions, and improved visibility and control in dynamic SDN environments.
+This project is a Python application that implements **intent-based networking** using a large language model (LLM). It integrates the LLM into the decision-making loop of an Software-Defined Network (SDN) by taking natural-language input from the operator and a snapshot of the current network state to propose and implement relevant changes in the network via the SDN controller. This project focuses on the addition of **ingress and egress filtering** in the SDN. The overall goal is to **simplify and automate network management**, so that humans can interact with the network using natural language, allowing for faster troubleshooting, safer action execution with confirmation, smarter decisions, and improved visibility and control in dynamic SDN environments.
 
 
 
-## Main Features
+## Key Components
 
 #### **Dynamic Network State Retrieval**
 Gathers real-time data about the network from the SDN controller, including MAC tables, port statistics, stop port states, flow tables, host-to-switch mappings, and implemented secuity policy rules. This maintains an up-to-date snapshot view of the network state for monitoring and decision-making. 
 
 #### **LLM-Powered Network Diagnostics**
-Anomaly detection and response. Uses OpenAI GPT-4o-mini to analyze the current network status to determine changes to security policies, including tightening ingress rules and whitelisting services. 
+Uses OpenAI GPT-4o-mini to analyze the current network status and determine changes to security policies. The LLM outputs new proposed network security policies as a JSON object (e.g. allow, deny, whitelist, and SAV actions) that the SDN controller can directly implement in the network.
 
 #### **Intent-Based Inference**
-Translates natural-language intents from the network engineer into SDN controller–compatible actions for ingress/egress filtering and related operations. For example, “Block outbound DNS from 10.0.0.0/24” or “Allow HTTPS only to 172.16.0.0/16” becomes precise OpenFlow matches (CIDRs, protocols, and ports) aligned with the current network state.
+Converts natural-language intents into SDN controller–compatible actions for ingress and egress filtering. 
+Translates user input like, “Block outbound HTTPS from h5” into precise OpenFlow matches (CIDRs, protocols, and ports) aligned with the current network state and the desired end-state.
 
 #### **Controller-Side Action Implementation**
-Executes LLM-generated actions directly on the controller using OpenFlow 1.3. Security rules land in a two-table pipeline (table 0 = policy gate, table 1 = L2 forwarding): allow routes traffic via GotoTable(1), while deny drops it. Also supports port state changes, flow installation/removal, and status checks.
+Executes LLM-generated actions directly on the controller using OpenFlow 1.3. Security rules are implemented as a three-table pipeline, in which:
+- Table 0: Security policies, including ingress and egress rules, and HTTPS whitelists
+- Table 1: Source Address Validation for anti-spoofing
+- Table 2: Standard L2 forwarding for MAC learning
+
+#### **PCAP traces**
+To audit and validate actions as well as debug potential issues, the `PacketManager` enables on-demand packet captures using `tcpdump` at chosen switch interfaces. The captures are saved with metadata as `.pcap`files in the `pcap_traces` folder, which can then be viewed and inspected using Wireshark.
+
+
+
+## Features for Ingress & Egress Filtering
+- **Inbound Service Blocking / Unblocking** 
+
+    *What?* Ingress rules for TCP, UDP, and ICMP.
+
+    *Why?* Provides fine-grained control over which services are allowed to enter the network. It is an important safeguard against malware attacks. Additionally, it enforces policy compliance and allows for safer diagnostics. 
+
+- **Outbound Service Blokcing / Unblocking** 
+
+    *What?* Egress rules for TCP, UDP, and ICMP.
+
+    *Why?* Provides fine-grained control over which services are allowed to leave the network. It is an important safeguard against malware attacks. Additionally, it enforces policy compliance and allows for safer diagnostics. 
+
+- **Source Address Validation (SAV)** 
+
+    *What?* Prevents IP spoofing by binding (IP, MAC, port). 
+
+    *Why?* Prevents IP/MAC spoofing attacks inside the network, as it ensures that hosts are not able to impersonate others. 
+
+- **Whitelisting HTTPS destinations** 
+
+    *What?* All HTTPS is denied in the network by default. User can sleectively whitelist HTTPS destinations. 
+
+    *Why?* HTTPS traffic is encrypted and can hide or disguise malicious traffic in the network. Therefore, enforcing a zero-trust policy for encrypted traffic improves security, as it only allows whitelisted (approved) hosts to be accessed, reducing the attack surface.
 
 
 
