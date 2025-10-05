@@ -203,8 +203,54 @@ GPT-4o-mini was chosen because it consistently produced well-formed JSON output 
 
 
 ### Building the prompt
+The system prompt, found in `/lib/system_prompts.py` defines the LLM's behavior and the output format. The system prompt includes the following: 
+1. **Role definition:** The LLM is given a set role, in this case a network policy decision engine, to constrain its behavior to be more deterministic and structured. 
+2. **Output schema:** The LLM is asked to provide all responses following a specific OpenFlow -compatible JSON schema with no extra commentary. Two example JSON objects are given to provide further context for the desired output.
+3. **Additional notes:** Additional notes are given at the end to provide further guidelines on SAV actions as this action is more complex and requires the LLM to do more inference on its own.
+
+In addition to the system prompt, a user prompt is also constructed by the Northbound Agent and sent to the LLM. The user prompt consists of real-time contextual data, including: 
+1. **User intent:** The user's natural language instruction, e.g. "Block all outbount ICMP traffic from h6."
+2. **Network topology:** The network topology describing the switch-to-host connectivity in the network. 
+3. **Current network state:** The current network state which is retrieved from the SDN controller via an API call to the `/intent/get-state` endpoint. 
+
+
+### Prompt engineering process
+The prompt engineering process of this project builds upon that of the previous project. For more information, please visit the [PatchHunter README file](https://github.com/wannalina/network-project). However, this project ultimately settled on a one-prompt strategy due to the change in LLM model from Claude Sonnet 4 to GPT-4o-mini as it is able to handle !!.
 
 
 
 ## FAQ
 
+#### What is included in the network snapshot?
+Each network snapshot includes the following, aggregated from all active switches: a list of switch IDs, the MAC table (mac_to_port), the host table (per-MAC location), port statistics, port description stats, STP port states, and flow stats. Although more network components can be additionally measured, these components are specifically chosen as they provide a sufficient picture of the network while still considering the cost and accuracy trade-offs of passing large network state objects to an LLM model **(It is more useful to ask an LLM to interpret a short network snapshot even if it contains less data as it can easily get confused when overwhelmed with large data volumes)**. 
+The currently provided data allows the LLM to determine the following: 
+- **Switches:** Which datapaths are currently registered and available for actions.
+- **MAC table:** Location of components in the network (hosts, switches, etc.) & detection of duplicate or flapping MAC addresses
+- **Port stats:** Assists in congestion detection and packet loss discovery through per-port counters
+- **Port description stats:** Administrative / operational state and attributes to spot down / misconfigured links
+- **STP port states:** Whether a port is FORWARD / BLOCK / etc., to avoid suggesting flows on blocked paths.
+- **Flow stats:** Installed matches / actions with packet / byte counts to find missing / incorrect rules.
+- **Host table:** Direct host to switch / port mapping to trace paths and verify reachability.
+- **Security rules:** Ingress and egress rules implemented in the network.
+
+The data is kept up to date in the SDN controller by issuing Ryu OpenFlow `requests—parser.OFPPortStatsRequest()` for per-port counters, `parser.OFPPortDescStatsRequest()` for port attributes / state, and `parser.OFPFlowStatsRequest()` for installed flow entries.
+
+#### Can PatchHunter modify the network automatically? 
+Only with user confirmation. It is improtant that the network engineer first carefully reviews the agent's recommendations and proposed actions before permitting them. While Claude Sonnet 4 is powerful, it may misinterpret ambigious input or edge-case data, which is why all actions require careful review by the user and explicit confrimation before modifying the network state.
+
+#### Can I see the effect of rules I apply?
+Yes. You can use packet captures, available at `pcap_traces/` after ending the capture, to inspect traffic before and after applying rules. Alternaticely, you can also check the controller’s flow table using the command: `ovs-ofctl dump-flows` in the Mininet terminal.
+
+#### How do I remove or revert a rule?
+You can use the same natural language interface, for example:
+- “Unblock inbound TCP to h5.”
+- “Unblock outbound ICMP from h3.”
+
+#### Does the controller need to be restarted when new rules are added or removed?
+No, the controller updates flow tables dynamically in real-time using OpenFlow messages.
+
+#### Why use an LLM for this instead of manual configuration?
+Manual OpenFlow rule management is complex and prone to errors. The LLM allows translating high-level objectives into precise, low-level configurations automatically (intent-based networking) while still allowing human validation before applying actions.
+
+#### Can this framework integrate with other controllers?
+The logic is built around the Ryu API, but the northbound interface is modular. Therefore, it can be adapted to other SDN controllers, such as ONOS or Floodlight, with some adjustments to the API.
