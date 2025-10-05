@@ -64,7 +64,9 @@ To audit and validate actions as well as debug potential issues, the `PacketMana
     0. *Exit the program:* The program will shut down. 
 
 - **Option 1: PCAP Traces**
-    - !!
+    - Start a capture by typing, "Start packet capture at sX-ethY" (e.g., s2-eth1). The agent will start a `tcpdump` on that interface and prints a unique capture ID. Files will be saved as timestamped `.pcap` in the folder `pcap_traces/` and can be opened in Wireshark. You can run multiple captures can run concurrently.
+    - Stop a single capture with "Stop capture with ID <capture_id>".
+    - Stop all by writing the command, "Stop all packet captures". 
 
 - **Option 2: Action Implementation**
     - **Network state retrieval:** When the user requests an action, the current state of the network is retrieved for analysis. A JSON object containing the switches, MAC tables, port statistics, port descriptions, stp port states, flow tables, host-to-switch mappings, and existing security policies is retrieved and sent to the LLM for analysis along with the query.
@@ -215,7 +217,7 @@ In addition to the system prompt, a user prompt is also constructed by the North
 
 
 ### Prompt engineering process
-The prompt engineering process of this project builds upon that of the previous project. For more information, please visit the [PatchHunter README file](https://github.com/wannalina/network-project). However, this project ultimately settled on a one-prompt strategy due to the change in LLM model from Claude Sonnet 4 to GPT-4o-mini as it is able to handle !!.
+The prompt engineering process of this project builds upon that of the previous project. For more information, please visit the [PatchHunter README file](https://github.com/wannalina/network-project). However, this project ultimately settled on a one-prompt strategy due to the change in LLM model from Claude Sonnet 4 to GPT-4o-mini as it is able to handle larger prompts (intent + topology.json + live controller state) in a single pass while still returning valid JSON.
 
 
 
