@@ -237,7 +237,7 @@ The currently provided data allows the LLM to determine the following:
 
 The data is kept up to date in the SDN controller by issuing Ryu OpenFlow `requests—parser.OFPPortStatsRequest()` for per-port counters, `parser.OFPPortDescStatsRequest()` for port attributes / state, and `parser.OFPFlowStatsRequest()` for installed flow entries.
 
-#### Can PatchHunter modify the network automatically? 
+#### Can the application modify the network automatically? 
 Only with user confirmation. It is improtant that the network engineer first carefully reviews the agent's recommendations and proposed actions before permitting them. While Claude Sonnet 4 is powerful, it may misinterpret ambigious input or edge-case data, which is why all actions require careful review by the user and explicit confrimation before modifying the network state.
 
 #### Can I see the effect of rules I apply?
